@@ -1,4 +1,5 @@
 #![no_std]
+#![no_main]
 
 mod data;
 mod utils;
@@ -6,9 +7,7 @@ mod utils;
 extern crate alloc;
 
 use alloc::{borrow::ToOwned, collections::BTreeMap, sync::Arc, vec::Vec};
-// use boringtun::Tunn;
-#[derive(Debug)]
-struct Tunn;
+use boringtun::Tunn;
 use kernel_alloc::KernelAlloc;
 use kernel_log::KernelLogger;
 use log::LevelFilter;
@@ -23,12 +22,22 @@ static ALLOCATOR: KernelAlloc = KernelAlloc;
 
 // These functions are required to shut the linker up.
 // Probably related to linker, panic, abort, exceptions, etc.
-#[no_mangle]
-pub extern "C" fn _DllMainCRTStartup() {}
-#[no_mangle]
-pub extern "C" fn __CxxFrameHandler3() {}
+// #[no_mangle]
+// pub extern "system" fn _DllMainCRTStartup() {}
+// #[no_mangle]
+// pub extern "C" fn __CxxFrameHandler3() {}
 #[no_mangle]
 pub extern "C" fn _fltused() {}
+// #[no_mangle]
+// pub extern "system" fn _RTC_CheckStackVars() {}
+// #[no_mangle]
+// pub extern "system" fn _RTC_InitBase() {}
+// #[no_mangle]
+// pub extern "system" fn _RTC_Shutdown() {}
+// #[no_mangle]
+// pub extern "system" fn SystemFunction036() {}
+// #[no_mangle]
+// pub extern "system" fn __imp_BCryptGenRandom() {}
 
 #[panic_handler]
 fn my_panic(info: &core::panic::PanicInfo) -> ! {
@@ -67,8 +76,8 @@ pub extern "C" fn rsInit() {
     // Create tunnels and associate them with appid
     STATE.lock().tunnels.insert(
         appid,
-        Arc::new(Mutex::new(todo!())),
-        // Arc::new(Mutex::new(make_tunn("privkey", "pubkey", 0))),
+        // Arc::new(Mutex::new(todo!())),
+        Arc::new(Mutex::new(make_tunn("privkey", "pubkey", 0))),
     );
 
     log::info!("rsInit exit");
