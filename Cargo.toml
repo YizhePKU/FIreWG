@@ -10,6 +10,9 @@ crate-type = ["staticlib"]
 [profile.dev]
 panic = "abort"
 
+[profile.release]
+panic = "abort"
+
 [dependencies]
 kernel-alloc = "0.2.1"
 kernel-log = "0.1.2"
