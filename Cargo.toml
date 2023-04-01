@@ -21,6 +21,7 @@ spin = "0.9.7"
 smoltcp = { version = "0.9.1", default-features = false, features = ["proto-ipv4"] }
 
 [patch.crates-io]
-hifitime = { path = "../hifitime" } # fix fmod linking bug
 boringtun = { path = "../boringtun" }
+hifitime = { path = "../hifitime" } # fix fmod linking bug
 ring = { path = "../ring" } # disable RTC & assert
+getrandom = { path = "../getrandom" } # force the use of rdrand
