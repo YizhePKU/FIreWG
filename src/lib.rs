@@ -6,42 +6,28 @@ mod utils;
 
 extern crate alloc;
 
-use alloc::{borrow::ToOwned, collections::BTreeMap, sync::Arc, vec::Vec};
+use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use boringtun::Tunn;
 use kernel_alloc::KernelAlloc;
 use kernel_log::KernelLogger;
 use log::LevelFilter;
 use smoltcp::wire::{IpProtocol, Ipv4Address, Ipv4Packet, TcpPacket, UdpPacket};
-use spin::Mutex;
+use spin::{Mutex, RwLock};
 
-use crate::data::{Appid, Connection};
-use crate::utils::make_tunn;
+use crate::{
+    data::{Appid, Connection},
+    utils::make_tunn,
+};
 
 #[global_allocator]
 static ALLOCATOR: KernelAlloc = KernelAlloc;
 
-// These functions are required to shut the linker up.
-// Probably related to linker, panic, abort, exceptions, etc.
-// #[no_mangle]
-// pub extern "system" fn _DllMainCRTStartup() {}
-// #[no_mangle]
-// pub extern "C" fn __CxxFrameHandler3() {}
 #[no_mangle]
 pub extern "C" fn _fltused() {}
-// #[no_mangle]
-// pub extern "system" fn _RTC_CheckStackVars() {}
-// #[no_mangle]
-// pub extern "system" fn _RTC_InitBase() {}
-// #[no_mangle]
-// pub extern "system" fn _RTC_Shutdown() {}
-// #[no_mangle]
-// pub extern "system" fn SystemFunction036() {}
-// #[no_mangle]
-// pub extern "system" fn __imp_BCryptGenRandom() {}
 
 #[panic_handler]
 fn my_panic(info: &core::panic::PanicInfo) -> ! {
-    log::error!("Panic: {}", info);
+    log::error!("Panic info: {}", info);
     loop {}
 }
 
@@ -51,20 +37,20 @@ struct State {
     pub tunnels: BTreeMap<Appid, Arc<Mutex<Tunn>>>,
     pub connections: BTreeMap<Connection, Arc<Mutex<Tunn>>>,
 }
-static STATE: Mutex<State> = Mutex::new(State {
+static STATE: RwLock<State> = RwLock::new(State {
     tunnels: BTreeMap::new(),
     connections: BTreeMap::new(),
 });
 
 #[no_mangle]
 pub extern "C" fn rsInit() {
-    log::info!("rsInit entry");
-
     KernelLogger::init(LevelFilter::Info).expect("Failed to initialize logger");
+
+    log::info!("rsInit entry");
 
     // Setup tracked processes
     // Hard-coded appid for now
-    let filename = r"\device\harddiskvolume4\program files (x86)\nmap\ncat.exe";
+    // let filename = r"\device\harddiskvolume4\program files (x86)\nmap\ncat.exe";
     let appid = Appid::from_u16_slice(&[
         92, 100, 101, 118, 105, 99, 101, 92, 104, 97, 114, 100, 100, 105, 115, 107, 118, 111, 108,
         117, 109, 101, 52, 92, 112, 114, 111, 103, 114, 97, 109, 32, 102, 105, 108, 101, 115, 32,
@@ -74,11 +60,15 @@ pub extern "C" fn rsInit() {
     ]);
 
     // Create tunnels and associate them with appid
-    STATE.lock().tunnels.insert(
-        appid,
-        // Arc::new(Mutex::new(todo!())),
-        Arc::new(Mutex::new(make_tunn("privkey", "pubkey", 0))),
+    let tunn = make_tunn(
+        "sGayjgm8dLj0gmNcry6VeGVuKZ1jQxicvDuOpG+pO1I=",
+        "dK6JxUPf0jEi3TkYJlTrQ5GkPFUvX7678ktFxylCgDg=",
+        0,
     );
+    STATE
+        .write()
+        .tunnels
+        .insert(appid, Arc::new(Mutex::new(tunn)));
 
     log::info!("rsInit exit");
 }
@@ -86,7 +76,7 @@ pub extern "C" fn rsInit() {
 #[no_mangle]
 pub extern "C" fn rsIsAppTracked(appid: *const u8, appid_size: u32) -> bool {
     let appid = Appid::new(appid, appid_size);
-    STATE.lock().tunnels.contains_key(&appid)
+    STATE.read().tunnels.contains_key(&appid)
 }
 
 #[no_mangle]
@@ -118,8 +108,8 @@ pub extern "C" fn rsRegisterConnection(
     };
     // Associate the connection with a tunnel, which should exist, since `rsIsAppTracked` already checks for tracking status.
     // There is no "time-of-check to time-of-use" bug since tunnels never changes after initialization.
-    let tunn = STATE.lock().tunnels.get(&appid).unwrap().clone();
-    STATE.lock().connections.insert(connection, tunn);
+    let tunn = STATE.read().tunnels.get(&appid).unwrap().clone();
+    STATE.write().connections.insert(connection, tunn);
     log::info!(
         "New connection: {}, {}:{} --> {}:{}",
         appid,
@@ -195,15 +185,14 @@ pub extern "C" fn rsHandleOutboundPacket(buf: *mut u8, size: u32) -> bool {
     };
 
     // Check if the connection is tracked, and if so, which tunnel it is associated with
-    let tunn = match STATE.lock().connections.get_mut(&connection) {
+    let tunn = match STATE.read().connections.get(&connection) {
         None => {
             return true;
         }
-        Some(tunn) => tunn,
+        Some(tunn) => tunn.clone(),
     };
 
-    // Encrypt the payload and reconstruct the packet.
-    // TODO
-    log::info!("Trying to encrypt payload for connection {connection}");
-    return false;
+    // TODO: Encrypt the payload and reconstruct the packet.
+    log::info!("Trying to encrypt payload for {connection}");
+    return true;
 }

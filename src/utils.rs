@@ -31,6 +31,11 @@ fn decode_key(base64: &str) -> Result<[u8; 32], &'static str> {
 /// # Panics
 ///
 /// Panic if [`peer_id`] cannot fit in a 24 bytes integer (which is 16M active peers).
+/// Panic if [`privkey`] or [`pubkey`] is not base64-encoded 32 bytes of data.
+///
+/// NOTE: 64-bit Windows kernel has a default stack size of 24KB, which is not enough for Tunn::new().
+/// Calling rsInit() with KeExpandKernelStackAndCalloutEx increases the stack size to about 70KB,
+/// barely enough for a release build with optimizations.
 pub fn make_tunn(privkey: &str, pubkey: &str, peer_id: u32) -> Tunn {
     if peer_id & 0xffffff != peer_id {
         panic!("Only 2^24 peers are supported at a time");

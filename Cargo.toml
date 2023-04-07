@@ -12,6 +12,7 @@ panic = "abort"
 
 [profile.release]
 panic = "abort"
+debug = true
 
 [dependencies]
 kernel-alloc = "0.2.1"
@@ -26,5 +27,5 @@ smoltcp = { version = "0.9.1", default-features = false, features = ["proto-ipv4
 [patch.crates-io]
 boringtun = { path = "../boringtun" }
 hifitime = { path = "../hifitime" } # fix fmod linking bug
-ring = { path = "../ring" } # disable RTC & assert
+ring = { path = "../ring" } # disable RTC & assert; compile C code in kernel mode
 getrandom = { path = "../getrandom" } # force the use of rdrand
