@@ -1,23 +1,65 @@
 #![no_std]
 #![no_main]
 
-mod data;
 mod utils;
 
 extern crate alloc;
 
-use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
+use alloc::{borrow::ToOwned, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use boringtun::Tunn;
+use core::fmt::Display;
 use kernel_alloc::KernelAlloc;
 use kernel_log::KernelLogger;
 use log::LevelFilter;
 use smoltcp::wire::{IpProtocol, Ipv4Address, Ipv4Packet, TcpPacket, UdpPacket};
 use spin::{Mutex, RwLock};
+use utils::make_tunn;
 
-use crate::{
-    data::{Appid, Connection},
-    utils::make_tunn,
-};
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Appid(Vec<u16>);
+
+impl Appid {
+    pub fn new(appid: *const u8, appid_size: u32) -> Self {
+        let slice =
+            unsafe { core::slice::from_raw_parts(appid as *const u16, appid_size as usize) };
+        Self(slice.to_owned())
+    }
+
+    pub fn from_u16_slice(slice: &[u16]) -> Self {
+        Self(slice.to_owned())
+    }
+}
+
+impl Display for Appid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Remove trailing NUL when printing
+        write!(
+            f,
+            "AppId({})",
+            String::from_utf16_lossy(&self.0).trim_matches('\0')
+        )
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+pub struct Connection {
+    pub protocol: IpProtocol,
+    pub local_addr: Ipv4Address,
+    pub local_port: u16,
+    pub remote_addr: Ipv4Address,
+    pub remote_port: u16,
+}
+
+impl Display for Connection {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Remove trailing NUL when printing
+        write!(
+            f,
+            "Connection({} {}:{} --> {}:{})",
+            self.protocol, self.local_addr, self.local_port, self.remote_addr, self.remote_port
+        )
+    }
+}
 
 #[global_allocator]
 static ALLOCATOR: KernelAlloc = KernelAlloc;
