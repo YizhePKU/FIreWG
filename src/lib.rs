@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(extern_types)]
 
 mod utils;
 
@@ -14,6 +15,21 @@ use log::LevelFilter;
 use smoltcp::wire::{IpProtocol, Ipv4Address, Ipv4Packet, TcpPacket, UdpPacket};
 use spin::{Mutex, RwLock};
 use utils::make_tunn;
+
+extern "C" {
+    pub type NetBufferList;
+
+    pub fn newNetBufferList(size: usize) -> *mut NetBufferList;
+    pub fn getBuffer(netBufferList: *mut NetBufferList, storage: *mut u8) -> *mut u8;
+    pub fn getBufferSize(netBufferList: *mut NetBufferList) -> usize;
+    pub fn sendPacket(netBufferList: *mut NetBufferList, compartmentId: u32);
+    pub fn recvPacket(
+        netBufferList: *mut NetBufferList,
+        compartmentId: u32,
+        interfaceIndex: u32,
+        subInterfaceIndex: u32,
+    );
+}
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Appid(Vec<u16>);
@@ -163,16 +179,32 @@ pub extern "C" fn rsRegisterConnection(
 }
 
 #[no_mangle]
-pub extern "C" fn rsHandleInboundPacket(buf: *mut u8, size: u32) -> bool {
-    let data = unsafe { core::slice::from_raw_parts_mut(buf, size as usize) };
+pub extern "C" fn rsHandleInboundPacket(
+    packet: *mut NetBufferList,
+    compartment_id: u32,
+    interface_index: u32,
+    sub_interface_index: u32,
+) -> bool {
+    // data has same lifetime as storage
+    let mut storage = [0; 2048];
+    let buffer = unsafe {
+        let buf = getBuffer(packet, storage.as_mut_ptr());
+        let size = getBufferSize(packet);
+        core::slice::from_raw_parts_mut(buf, size as usize)
+    };
 
-    // log::info!("rsHandleInboundPacket entry. data: {data:?}");
     true
 }
 
 #[no_mangle]
-pub extern "C" fn rsHandleOutboundPacket(buf: *mut u8, size: u32) -> bool {
-    let buffer = unsafe { core::slice::from_raw_parts(buf, size as usize) };
+pub extern "C" fn rsHandleOutboundPacket(packet: *mut NetBufferList, compartment_id: u32) -> bool {
+    // data has same lifetime as storage
+    let mut storage = [0; 2048];
+    let buffer = unsafe {
+        let buf = getBuffer(packet, storage.as_mut_ptr());
+        let size = getBufferSize(packet);
+        core::slice::from_raw_parts(buf, size as usize)
+    };
 
     // Parse packet
     // TODO: Surely there's a cleaner way to handle all these match branches...
@@ -235,6 +267,19 @@ pub extern "C" fn rsHandleOutboundPacket(buf: *mut u8, size: u32) -> bool {
     };
 
     // TODO: Encrypt the payload and reconstruct the packet.
-    log::info!("Trying to encrypt payload for {connection}");
-    return true;
+    // For now let's just reinject the same packet
+    log::info!("Reinjecting packet...");
+    assert!(buffer.len() < 256);
+
+    unsafe {
+        let nbl = newNetBufferList(buffer.len());
+        let mut storage = [0; 256];
+        let dst = getBuffer(nbl, storage.as_mut_ptr());
+        core::ptr::copy_nonoverlapping(buffer.as_ptr(), dst, buffer.len());
+        sendPacket(nbl, compartment_id);
+    }
+
+    log::info!("Reinject complete");
+
+    return false;
 }
