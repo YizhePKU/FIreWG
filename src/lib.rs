@@ -122,7 +122,7 @@ pub extern "C" fn rsInit() {
     // Create tunnels and associate them with appid
     let tunn = make_tunn(
         "sGayjgm8dLj0gmNcry6VeGVuKZ1jQxicvDuOpG+pO1I=",
-        "dK6JxUPf0jEi3TkYJlTrQ5GkPFUvX7678ktFxylCgDg=",
+        "RtdFk601fL2xf4ig3bryPi1kRblUSOn2JkQGbxn/hyQ=",
         0,
     );
     STATE
@@ -225,7 +225,6 @@ pub extern "C" fn rsHandleOutboundPacket(nbl: *mut NetBufferList, compartment_id
         boringtun::TunnResult::WriteToNetwork(payload) => {
             log::info!("Encrypted payload: {:?}", payload);
 
-            // TODO: Do I need to fill in checksum?
             ipv4_slice[0] = 0x45; // Version & IHL
             ipv4_slice[2..4].copy_from_slice(&u16::to_be_bytes(28 + payload.len() as u16)); // Total length
             ipv4_slice[8] = 64; // TTL
