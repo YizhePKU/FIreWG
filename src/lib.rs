@@ -2,6 +2,7 @@
 #![no_main]
 #![feature(extern_types)]
 
+mod kernel_buffer;
 mod utils;
 
 extern crate alloc;
@@ -10,9 +11,9 @@ use alloc::{borrow::ToOwned, collections::BTreeMap, string::String, sync::Arc, v
 use boringtun::Tunn;
 use core::fmt::Display;
 use kernel_alloc::KernelAlloc;
+use kernel_buffer::KernelBuffer;
 use kernel_log::KernelLogger;
 use log::LevelFilter;
-use smoltcp::wire::{IpProtocol, Ipv4Address, Ipv4Packet, TcpPacket, UdpPacket};
 use spin::{Mutex, RwLock};
 use utils::make_tunn;
 
@@ -20,6 +21,7 @@ extern "C" {
     pub type NetBufferList;
 
     pub fn newNetBufferList(size: usize) -> *mut NetBufferList;
+    pub fn freeNetBufferList(netBufferList: *mut NetBufferList);
     pub fn getBuffer(netBufferList: *mut NetBufferList, storage: *mut u8) -> *mut u8;
     pub fn getBufferSize(netBufferList: *mut NetBufferList) -> usize;
     pub fn sendPacket(netBufferList: *mut NetBufferList, compartmentId: u32);
@@ -59,10 +61,10 @@ impl Display for Appid {
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub struct Connection {
-    pub protocol: IpProtocol,
-    pub local_addr: Ipv4Address,
+    pub protocol: u8,
+    pub local_addr: [u8; 4],
     pub local_port: u16,
-    pub remote_addr: Ipv4Address,
+    pub remote_addr: [u8; 4],
     pub remote_port: u16,
 }
 
@@ -71,7 +73,7 @@ impl Display for Connection {
         // Remove trailing NUL when printing
         write!(
             f,
-            "Connection({} {}:{} --> {}:{})",
+            "Connection({} {:?}:{} --> {:?}:{})",
             self.protocol, self.local_addr, self.local_port, self.remote_addr, self.remote_port
         )
     }
@@ -154,28 +156,17 @@ pub extern "C" fn rsRegisterConnection(
 
     let appid = Appid::new(appid, appid_size);
     let connection = Connection {
-        protocol: if protocol == 6 {
-            IpProtocol::Tcp
-        } else {
-            IpProtocol::Udp
-        },
-        local_addr: Ipv4Address::from_bytes(&local_addr.to_be_bytes()),
+        protocol,
+        local_addr: local_addr.to_be_bytes(),
         local_port,
-        remote_addr: Ipv4Address::from_bytes(&remote_addr.to_be_bytes()),
+        remote_addr: remote_addr.to_be_bytes(),
         remote_port,
     };
     // Associate the connection with a tunnel, which should exist, since `rsIsAppTracked` already checks for tracking status.
     // There is no "time-of-check to time-of-use" bug since tunnels never changes after initialization.
     let tunn = STATE.read().tunnels.get(&appid).unwrap().clone();
     STATE.write().connections.insert(connection, tunn);
-    log::info!(
-        "New connection: {}, {}:{} --> {}:{}",
-        appid,
-        connection.local_addr,
-        connection.local_port,
-        connection.remote_addr,
-        connection.remote_port
-    );
+    log::info!("New connection for {}: {}", appid, connection);
 }
 
 #[no_mangle]
@@ -197,89 +188,71 @@ pub extern "C" fn rsHandleInboundPacket(
 }
 
 #[no_mangle]
-pub extern "C" fn rsHandleOutboundPacket(packet: *mut NetBufferList, compartment_id: u32) -> bool {
-    // data has same lifetime as storage
-    let mut storage = [0; 2048];
-    let buffer = unsafe {
-        let buf = getBuffer(packet, storage.as_mut_ptr());
-        let size = getBufferSize(packet);
-        core::slice::from_raw_parts(buf, size as usize)
+pub extern "C" fn rsHandleOutboundPacket(nbl: *mut NetBufferList, compartment_id: u32) -> bool {
+    let src_buffer = KernelBuffer::from_nbl(nbl);
+
+    let packet = src_buffer.as_slice();
+    if packet[0] >> 4 != 4 {
+        log::info!("Skipping non-IPv4 packet");
+        return true;
+    }
+    let header_len = ((packet[0] & 0xf) * 4) as usize;
+    let connection = Connection {
+        protocol: packet[9],
+        local_addr: packet[12..16].try_into().unwrap(),
+        local_port: u16::from_be_bytes(packet[header_len..header_len + 2].try_into().unwrap()),
+        remote_addr: packet[16..20].try_into().unwrap(),
+        remote_port: u16::from_be_bytes(packet[header_len + 2..header_len + 4].try_into().unwrap()),
     };
 
-    // Parse packet
-    // TODO: Surely there's a cleaner way to handle all these match branches...
-    let ipv4_packet = match Ipv4Packet::new_checked(buffer) {
-        Err(_) => {
-            return true;
-        }
-        Ok(packet) => {
-            if packet.version() != 4 {
-                return true;
-            }
-            packet
-        }
-    };
-    let protocol = ipv4_packet.next_header();
-    let (connection, payload) = match protocol {
-        IpProtocol::Tcp => match TcpPacket::new_checked(ipv4_packet.payload()) {
-            Err(_) => {
-                return true;
-            }
-            Ok(tcp_packet) => {
-                let connection = Connection {
-                    protocol,
-                    local_addr: ipv4_packet.src_addr(),
-                    local_port: tcp_packet.src_port(),
-                    remote_addr: ipv4_packet.dst_addr(),
-                    remote_port: tcp_packet.dst_port(),
-                };
-                let payload = tcp_packet.payload();
-                (connection, payload)
-            }
-        },
-        IpProtocol::Udp => match UdpPacket::new_checked(ipv4_packet.payload()) {
-            Err(_) => {
-                return true;
-            }
-            Ok(udp_packet) => {
-                let connection = Connection {
-                    protocol,
-                    local_addr: ipv4_packet.src_addr(),
-                    local_port: udp_packet.src_port(),
-                    remote_addr: ipv4_packet.dst_addr(),
-                    remote_port: udp_packet.dst_port(),
-                };
-                let payload = udp_packet.payload();
-                (connection, payload)
-            }
-        },
-        _ => {
-            return true;
-        }
-    };
-
-    // Check if the connection is tracked, and if so, which tunnel it is associated with
+    // Check if the connection is tracked, and if so, which tunnel it is associated with.
     let tunn = match STATE.read().connections.get(&connection) {
+        Some(tunn) => tunn.clone(),
         None => {
             return true;
         }
-        Some(tunn) => tunn.clone(),
     };
 
-    // TODO: Encrypt the payload and reconstruct the packet.
-    // For now let's just reinject the same packet
-    log::info!("Reinjecting packet...");
-    assert!(buffer.len() < 256);
+    log::info!("Trying to encrypt packet for {}", connection);
 
-    unsafe {
-        let nbl = newNetBufferList(buffer.len());
-        let mut storage = [0; 256];
-        let dst = getBuffer(nbl, storage.as_mut_ptr());
-        core::ptr::copy_nonoverlapping(buffer.as_ptr(), dst, buffer.len());
-        sendPacket(nbl, compartment_id);
+    // Encrypt the payload.
+    // IP header (20 bytes) -- UDP header (8 bytes) -- payload
+    let mut buffer = KernelBuffer::new(20 + 8 + core::cmp::max(packet.len() + 32, 148));
+    let (header_slice, payload_slice) = buffer.as_slice_mut().split_at_mut(28);
+    let (ipv4_slice, udp_slice) = header_slice.split_at_mut(20);
+    let mut tunn_lock = tunn.lock();
+    match tunn_lock.encapsulate(packet, payload_slice) {
+        boringtun::TunnResult::WriteToNetwork(payload) => {
+            log::info!("Encrypted payload: {:?}", payload);
+
+            // TODO: Do I need to fill in checksum?
+            ipv4_slice[0] = 0x45; // Version & IHL
+            ipv4_slice[2..4].copy_from_slice(&u16::to_be_bytes(28 + payload.len() as u16)); // Total length
+            ipv4_slice[8] = 64; // TTL
+            ipv4_slice[9] = 17; // Protocol = UDP
+            ipv4_slice[12..16].copy_from_slice(&connection.local_addr); // src_addr
+            ipv4_slice[16..20].copy_from_slice(&[192, 168, 196, 136]); // dst_addr
+
+            udp_slice[0..2].copy_from_slice(&u16::to_be_bytes(connection.local_port)); // src_port
+            udp_slice[2..4].copy_from_slice(&u16::to_be_bytes(12345)); // dst_port
+            udp_slice[4..6].copy_from_slice(&u16::to_be_bytes(8 + payload.len() as u16)); // Length
+
+            log::info!("Sending packet...");
+            log::info!("Headers: {:?}", header_slice);
+            log::info!("Payload: {:?}", payload_slice);
+
+            // Send the packet
+            unsafe { sendPacket(buffer.as_nbl(), compartment_id) };
+            return false;
+        }
+        boringtun::TunnResult::Done => {
+            log::info!("Waiting for handshake");
+            return false;
+        }
+        boringtun::TunnResult::Err(err) => {
+            log::error!("Encryption error: {:?}", err);
+            return false;
+        }
+        _ => unreachable!(),
     }
-
-    log::info!("Reinject complete");
-
-    return false;
 }

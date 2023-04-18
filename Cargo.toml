@@ -22,7 +22,6 @@ boringtun = "0.5.2"
 x25519-dalek = { version = "2.0.0-pre.1", default-features = false, features = ["u64_backend"] }
 base64 = { version = "0.21.0", default-features = false, features = ["alloc"] }
 spin = "0.9.7"
-smoltcp = { version = "0.9.1", default-features = false, features = ["proto-ipv4"] }
 
 [patch.crates-io]
 boringtun = { path = "../boringtun" }
