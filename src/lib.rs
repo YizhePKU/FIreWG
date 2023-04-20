@@ -31,6 +31,7 @@ extern "C" {
         interfaceIndex: u32,
         subInterfaceIndex: u32,
     );
+    pub fn dbgBreak() -> !;
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -88,6 +89,7 @@ pub extern "C" fn _fltused() {}
 #[panic_handler]
 fn my_panic(info: &core::panic::PanicInfo) -> ! {
     log::error!("Panic info: {}", info);
+    // unsafe { dbgBreak() }
     loop {}
 }
 
@@ -171,29 +173,107 @@ pub extern "C" fn rsRegisterConnection(
 
 #[no_mangle]
 pub extern "C" fn rsHandleInboundPacket(
-    packet: *mut NetBufferList,
+    nbl: *mut NetBufferList,
     compartment_id: u32,
     interface_index: u32,
     sub_interface_index: u32,
 ) -> bool {
-    // data has same lifetime as storage
-    let mut storage = [0; 2048];
-    let buffer = unsafe {
-        let buf = getBuffer(packet, storage.as_mut_ptr());
-        let size = getBufferSize(packet);
-        core::slice::from_raw_parts_mut(buf, size as usize)
-    };
+    let src_buffer = unsafe { KernelBuffer::from_nbl(nbl) };
 
-    true
+    let packet = src_buffer.as_slice();
+    if packet[0] >> 4 != 4 {
+        return true;
+    }
+    let header_len = ((packet[0] & 0xf) * 4) as usize;
+
+    // HACK: intercept all UDP packets coming from 172.21.176.3:12345
+    // This should be saved in STATE.
+    let local_addr: [u8; 4] = packet[16..20].try_into().unwrap();
+    let local_port = u16::from_be_bytes(packet[header_len + 2..header_len + 4].try_into().unwrap());
+    let remote_addr: [u8; 4] = packet[12..16].try_into().unwrap();
+    let remote_port = u16::from_be_bytes(packet[header_len..header_len + 2].try_into().unwrap());
+    if remote_addr == [172, 21, 176, 3] && remote_port == 12345 {
+        // Decapsulate the packet.
+        log::info!("Decapsulating packet for 172.21.176.3:12345");
+        let tunn = STATE.read().tunnels.first_key_value().unwrap().1.clone();
+
+        // Decapsulate the packet.
+        let buffer_len = packet.len(); // should be enough?
+        let mut encrypted_packet = &packet[header_len + 8..]; // set to &[] for repeated call
+        let mut tunn_lock = tunn.lock();
+        // TODO: fill-in src_addr for under-load condition
+        loop {
+            let mut dst_buffer = KernelBuffer::new(buffer_len);
+            match tunn_lock.decapsulate(None, encrypted_packet, dst_buffer.as_slice_mut()) {
+                boringtun::TunnResult::Done => {
+                    log::info!("TunnResult::Done");
+                    return false;
+                }
+                boringtun::TunnResult::WriteToNetwork(data) => {
+                    let data_len = data.len();
+                    // allocate a new NBL and copy the encrypted packet, since we need to add headers.
+                    let mut out_buffer = KernelBuffer::new(28 + data_len);
+                    let (header_slice, data_slice) = out_buffer.as_slice_mut().split_at_mut(28);
+                    let (ipv4_slice, udp_slice) = header_slice.split_at_mut(20);
+                    data_slice.copy_from_slice(data);
+                    // free-up dst_buffer since we'll not inject it to the network.
+                    unsafe { freeNetBufferList(dst_buffer.into_nbl()) };
+
+                    ipv4_slice[0] = 0x45; // Version & IHL
+                    ipv4_slice[2..4].copy_from_slice(&u16::to_be_bytes(28 + data_len as u16)); // Total length
+                    ipv4_slice[8] = 64; // TTL
+                    ipv4_slice[9] = 17; // Protocol = UDP
+                    ipv4_slice[12..16].copy_from_slice(&local_addr); // src_addr
+                    ipv4_slice[16..20].copy_from_slice(&[172, 21, 176, 3]); // dst_addr
+                    udp_slice[0..2].copy_from_slice(&u16::to_be_bytes(local_port)); // src_port
+                    udp_slice[2..4].copy_from_slice(&u16::to_be_bytes(12345)); // dst_port
+                    udp_slice[4..6].copy_from_slice(&u16::to_be_bytes(8 + data_len as u16)); // Length
+
+                    log::info!("rsHandleInboundPacket: WriteToNetwork");
+                    log::info!("Headers: {:?}", header_slice);
+                    log::info!("Data: {:?}", data_slice);
+
+                    // Send the packet
+                    unsafe { sendPacket(out_buffer.into_nbl(), compartment_id) };
+
+                    encrypted_packet = &mut []; // loop and call decapsulate() again
+                }
+                boringtun::TunnResult::WriteToTunnelV4(packet, src_addr) => {
+                    // packet may be truncated because of incorrect length, but we'll skip that.
+                    // src_addr should be checked against crypto routing table, but we'll skip that.
+                    log::info!("rsHandleInboundPacket: WriteToTunnelV4");
+                    log::info!("Packet: {:?}", packet);
+                    unsafe {
+                        recvPacket(
+                            dst_buffer.into_nbl(),
+                            compartment_id,
+                            interface_index,
+                            sub_interface_index,
+                        );
+                    }
+                    return false;
+                }
+                boringtun::TunnResult::WriteToTunnelV6(_, _) => {
+                    log::error!("IPv6 encapsulation is not supported");
+                    return false;
+                }
+                boringtun::TunnResult::Err(err) => {
+                    log::error!("Decapsulation error: {:?}", err);
+                    return false;
+                }
+            }
+        }
+    } else {
+        return true;
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn rsHandleOutboundPacket(nbl: *mut NetBufferList, compartment_id: u32) -> bool {
-    let src_buffer = KernelBuffer::from_nbl(nbl);
+    let src_buffer = unsafe { KernelBuffer::from_nbl(nbl) };
 
     let packet = src_buffer.as_slice();
     if packet[0] >> 4 != 4 {
-        log::info!("Skipping non-IPv4 packet");
         return true;
     }
     let header_len = ((packet[0] & 0xf) * 4) as usize;
@@ -213,39 +293,36 @@ pub extern "C" fn rsHandleOutboundPacket(nbl: *mut NetBufferList, compartment_id
         }
     };
 
-    log::info!("Trying to encrypt packet for {}", connection);
+    log::info!("Encapsulating packet for {}", connection);
 
-    // Encrypt the payload.
-    // IP header (20 bytes) -- UDP header (8 bytes) -- payload
-    let mut buffer = KernelBuffer::new(20 + 8 + core::cmp::max(packet.len() + 32, 148));
-    let (header_slice, payload_slice) = buffer.as_slice_mut().split_at_mut(28);
+    // Encapsulate the packet.
+    // IP header (20 bytes) -- UDP header (8 bytes) -- data
+    let mut dst_buffer = KernelBuffer::new(20 + 8 + core::cmp::max(packet.len() + 32, 148));
+    let (header_slice, data_slice) = dst_buffer.as_slice_mut().split_at_mut(28);
     let (ipv4_slice, udp_slice) = header_slice.split_at_mut(20);
     let mut tunn_lock = tunn.lock();
-    match tunn_lock.encapsulate(packet, payload_slice) {
-        boringtun::TunnResult::WriteToNetwork(payload) => {
-            log::info!("Encrypted payload: {:?}", payload);
-
+    match tunn_lock.encapsulate(packet, data_slice) {
+        boringtun::TunnResult::WriteToNetwork(data) => {
             ipv4_slice[0] = 0x45; // Version & IHL
-            ipv4_slice[2..4].copy_from_slice(&u16::to_be_bytes(28 + payload.len() as u16)); // Total length
+            ipv4_slice[2..4].copy_from_slice(&u16::to_be_bytes(28 + data.len() as u16)); // Total length
             ipv4_slice[8] = 64; // TTL
             ipv4_slice[9] = 17; // Protocol = UDP
             ipv4_slice[12..16].copy_from_slice(&connection.local_addr); // src_addr
-            ipv4_slice[16..20].copy_from_slice(&[192, 168, 196, 136]); // dst_addr
+            ipv4_slice[16..20].copy_from_slice(&[172, 21, 176, 3]); // dst_addr
 
             udp_slice[0..2].copy_from_slice(&u16::to_be_bytes(connection.local_port)); // src_port
             udp_slice[2..4].copy_from_slice(&u16::to_be_bytes(12345)); // dst_port
-            udp_slice[4..6].copy_from_slice(&u16::to_be_bytes(8 + payload.len() as u16)); // Length
+            udp_slice[4..6].copy_from_slice(&u16::to_be_bytes(8 + data.len() as u16)); // Length
 
-            log::info!("Sending packet...");
+            log::info!("rsHandleOutboundPacket: WriteToNetwork");
             log::info!("Headers: {:?}", header_slice);
-            log::info!("Payload: {:?}", payload_slice);
+            log::info!("Data: {:?}", data_slice);
 
             // Send the packet
-            unsafe { sendPacket(buffer.as_nbl(), compartment_id) };
+            unsafe { sendPacket(dst_buffer.into_nbl(), compartment_id) };
             return false;
         }
         boringtun::TunnResult::Done => {
-            log::info!("Waiting for handshake");
             return false;
         }
         boringtun::TunnResult::Err(err) => {
