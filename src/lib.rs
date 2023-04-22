@@ -242,6 +242,12 @@ pub extern "C" fn rsHandleInboundPacket(
                     // packet may be truncated because of incorrect length, but we'll skip that.
                     // src_addr should be checked against crypto routing table, but we'll skip that.
                     log::info!("recvPacket {packet:?}");
+
+                    // HACK: rewrite dst_addr with original IP (instead of wireguard interface IP)
+                    // so that local application can recognize the packet.
+                    packet[16..20].copy_from_slice(&local_addr);
+                    fix_checksum(packet);
+
                     unsafe {
                         recvPacket(
                             dst_buffer.into_nbl(),
@@ -292,27 +298,25 @@ pub extern "C" fn rsHandleOutboundPacket(nbl: *mut NetBufferList, compartment_id
         }
     };
 
-    let fixed_packet = src_buffer.as_slice_mut_temporary();
+    let temp_packet = src_buffer.as_slice_mut_temporary();
 
     // HACK: rewrite local_addr with Wireguard interface address.
     // Since we don't have a real interface, the packet has the default interface address, which means
     // the reply will not be encrypted by the peer.
-    fixed_packet[12..16].copy_from_slice(&[10, 0, 0, 2]);
+    temp_packet[12..16].copy_from_slice(&[10, 0, 0, 2]);
 
-    // HACK: fix IPv4 header checksum before we actually encapsulate the packet.
+    // Fix IPv4 header checksum before we actually encapsulate the packet.
     // This is normally done by checksum offload, but it doesn't work when encapsulated.
-    fix_ipv4_checksum(fixed_packet);
-
-    // HACK: set UDP checksum to zero, since we modified IP headers.
-    fixed_packet[header_len + 6..header_len + 8].copy_from_slice(&[0, 0]);
+    // Also, since we modified local_addr, the original TCP/UDP checksum is now incorrect.
+    fix_checksum(temp_packet);
 
     // Encapsulate the packet.
     // IP header (20 bytes) -- UDP header (8 bytes) -- data
-    let mut dst_buffer = KernelBuffer::new(20 + 8 + core::cmp::max(fixed_packet.len() + 32, 148));
+    let mut dst_buffer = KernelBuffer::new(20 + 8 + core::cmp::max(temp_packet.len() + 32, 148));
     let (header_slice, data_slice) = dst_buffer.as_slice_mut().split_at_mut(28);
     let (ipv4_slice, udp_slice) = header_slice.split_at_mut(20);
     let mut tunn_lock = tunn.lock();
-    match tunn_lock.encapsulate(fixed_packet, data_slice) {
+    match tunn_lock.encapsulate(temp_packet, data_slice) {
         boringtun::TunnResult::WriteToNetwork(data) => {
             ipv4_slice[0] = 0x45; // Version & IHL
             ipv4_slice[2..4].copy_from_slice(&u16::to_be_bytes(28 + data.len() as u16)); // Total length
@@ -342,13 +346,43 @@ pub extern "C" fn rsHandleOutboundPacket(nbl: *mut NetBufferList, compartment_id
     }
 }
 
-// Fill-in checksum for an IPv4 packet.
-// Assumes the current checksum is zero.
-fn fix_ipv4_checksum(packet: &mut [u8]) {
-    assert!(packet[10] == 0 && packet[11] == 0);
+// Fix IPv4 & TCP/UDP checksums for an IPv4 packet.
+fn fix_checksum(packet: &mut [u8]) {
+    let protocal = packet[9];
+    let ipv4_header_len = ((packet[0] & 0xf) * 4) as usize;
 
-    let header_len = ((packet[0] & 0xf) * 4) as usize;
+    let (ip_header, transport_header) = packet.split_at_mut(ipv4_header_len);
+
+    // clear IPv4 checksum
+    ip_header[10..12].copy_from_slice(&[0, 0]);
+
+    if protocal == 6 {
+        // clear TCP checksum
+        transport_header[16..18].copy_from_slice(&[0, 0]);
+    } else if protocal == 17 {
+        // clear UDP checksum
+        transport_header[6..8].copy_from_slice(&[0, 0]);
+    } else {
+        unreachable!()
+    }
+
     let mut checksum = Checksum::new();
-    checksum.add_bytes(&packet[..header_len]);
-    packet[10..12].copy_from_slice(&checksum.checksum());
+
+    // calculate IPv4 checksum
+    checksum.add_bytes(ip_header);
+    let ipv4_checksum = checksum.checksum();
+
+    // FIXME: Leaving TCP/UDP checksums with zero
+
+    // if protocal == 6 {
+    //     // fill in TCP checksum
+    //     transport_header[16..18].copy_from_slice(&[0, 0]);
+    // } else if protocal == 17 {
+    //     // UDP checksum is optional in IPv4, skipping
+    // } else {
+    //     unreachable!()
+    // }
+
+    // fill in IPv4 checksum
+    packet[10..12].copy_from_slice(&ipv4_checksum);
 }
