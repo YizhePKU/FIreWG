@@ -2,6 +2,7 @@
 #![no_main]
 #![feature(extern_types)]
 
+mod checksum;
 mod kernel_buffer;
 mod utils;
 
@@ -9,6 +10,7 @@ extern crate alloc;
 
 use alloc::{borrow::ToOwned, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use boringtun::Tunn;
+use checksum::Checksum;
 use core::fmt::Display;
 use kernel_alloc::KernelAlloc;
 use kernel_buffer::KernelBuffer;
@@ -186,15 +188,15 @@ pub extern "C" fn rsHandleInboundPacket(
     }
     let header_len = ((packet[0] & 0xf) * 4) as usize;
 
-    // HACK: intercept all UDP packets coming from 172.21.176.3:12345
+    // HACK: intercept all UDP packets coming from 169.254.1.3:12345
     // This should be saved in STATE.
     let local_addr: [u8; 4] = packet[16..20].try_into().unwrap();
     let local_port = u16::from_be_bytes(packet[header_len + 2..header_len + 4].try_into().unwrap());
     let remote_addr: [u8; 4] = packet[12..16].try_into().unwrap();
     let remote_port = u16::from_be_bytes(packet[header_len..header_len + 2].try_into().unwrap());
-    if remote_addr == [172, 21, 176, 3] && remote_port == 12345 {
+    if remote_addr == [169, 254, 1, 3] && remote_port == 12345 {
         // Decapsulate the packet.
-        log::info!("Decapsulating packet for 172.21.176.3:12345");
+        log::info!("Decapsulating packet for 169.254.1.3:12345");
         let tunn = STATE.read().tunnels.first_key_value().unwrap().1.clone();
 
         // Decapsulate the packet.
@@ -224,7 +226,7 @@ pub extern "C" fn rsHandleInboundPacket(
                     ipv4_slice[8] = 64; // TTL
                     ipv4_slice[9] = 17; // Protocol = UDP
                     ipv4_slice[12..16].copy_from_slice(&local_addr); // src_addr
-                    ipv4_slice[16..20].copy_from_slice(&[172, 21, 176, 3]); // dst_addr
+                    ipv4_slice[16..20].copy_from_slice(&[169, 254, 1, 3]); // dst_addr
                     udp_slice[0..2].copy_from_slice(&u16::to_be_bytes(local_port)); // src_port
                     udp_slice[2..4].copy_from_slice(&u16::to_be_bytes(12345)); // dst_port
                     udp_slice[4..6].copy_from_slice(&u16::to_be_bytes(8 + data_len as u16)); // Length
@@ -270,7 +272,7 @@ pub extern "C" fn rsHandleInboundPacket(
 
 #[no_mangle]
 pub extern "C" fn rsHandleOutboundPacket(nbl: *mut NetBufferList, compartment_id: u32) -> bool {
-    let src_buffer = unsafe { KernelBuffer::from_nbl(nbl) };
+    let mut src_buffer = unsafe { KernelBuffer::from_nbl(nbl) };
 
     let packet = src_buffer.as_slice();
     if packet[0] >> 4 != 4 {
@@ -285,6 +287,12 @@ pub extern "C" fn rsHandleOutboundPacket(nbl: *mut NetBufferList, compartment_id
         remote_port: u16::from_be_bytes(packet[header_len + 2..header_len + 4].try_into().unwrap()),
     };
 
+    log::info!(
+        "Checking {} against State {:?}",
+        connection,
+        STATE.read().connections
+    );
+
     // Check if the connection is tracked, and if so, which tunnel it is associated with.
     let tunn = match STATE.read().connections.get(&connection) {
         Some(tunn) => tunn.clone(),
@@ -295,20 +303,25 @@ pub extern "C" fn rsHandleOutboundPacket(nbl: *mut NetBufferList, compartment_id
 
     log::info!("Encapsulating packet for {}", connection);
 
+    // Fix IPv4 header checksum before we actually encapsulate the packet.
+    // This is normally done by checksum offload, but it doesn't work when encapsulated.
+    let fixed_packet = src_buffer.as_slice_mut_temporary();
+    fix_ipv4_checksum(fixed_packet);
+
     // Encapsulate the packet.
     // IP header (20 bytes) -- UDP header (8 bytes) -- data
-    let mut dst_buffer = KernelBuffer::new(20 + 8 + core::cmp::max(packet.len() + 32, 148));
+    let mut dst_buffer = KernelBuffer::new(20 + 8 + core::cmp::max(fixed_packet.len() + 32, 148));
     let (header_slice, data_slice) = dst_buffer.as_slice_mut().split_at_mut(28);
     let (ipv4_slice, udp_slice) = header_slice.split_at_mut(20);
     let mut tunn_lock = tunn.lock();
-    match tunn_lock.encapsulate(packet, data_slice) {
+    match tunn_lock.encapsulate(fixed_packet, data_slice) {
         boringtun::TunnResult::WriteToNetwork(data) => {
             ipv4_slice[0] = 0x45; // Version & IHL
             ipv4_slice[2..4].copy_from_slice(&u16::to_be_bytes(28 + data.len() as u16)); // Total length
             ipv4_slice[8] = 64; // TTL
             ipv4_slice[9] = 17; // Protocol = UDP
             ipv4_slice[12..16].copy_from_slice(&connection.local_addr); // src_addr
-            ipv4_slice[16..20].copy_from_slice(&[172, 21, 176, 3]); // dst_addr
+            ipv4_slice[16..20].copy_from_slice(&[169, 254, 1, 3]); // dst_addr
 
             udp_slice[0..2].copy_from_slice(&u16::to_be_bytes(connection.local_port)); // src_port
             udp_slice[2..4].copy_from_slice(&u16::to_be_bytes(12345)); // dst_port
@@ -331,4 +344,19 @@ pub extern "C" fn rsHandleOutboundPacket(nbl: *mut NetBufferList, compartment_id
         }
         _ => unreachable!(),
     }
+}
+
+// Fill-in checksum for an IPv4 packet.
+// Assumes the current checksum is zero.
+fn fix_ipv4_checksum(packet: &mut [u8]) {
+    log::info!("fix_ipv4_checksum for {:?}", packet);
+
+    assert!(packet[10] == 0 && packet[11] == 0);
+
+    let header_len = ((packet[0] & 0xf) * 4) as usize;
+    let mut checksum = Checksum::new();
+    checksum.add_bytes(&packet[..header_len]);
+    packet[10..12].copy_from_slice(&checksum.checksum());
+
+    log::info!("Post fix: {:?}", packet);
 }

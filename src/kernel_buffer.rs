@@ -60,6 +60,16 @@ impl KernelBuffer {
         }
     }
 
+    // Return a writeable view of the underlying buffer.
+    // May write into the temporary local memory, which is accessible via the slice but not stored in the NBL.
+    pub fn as_slice_mut_temporary(&mut self) -> &mut [u8] {
+        unsafe {
+            let ptr = getBuffer(self.nbl, self.storage.borrow_mut().as_mut_ptr());
+            assert!(!ptr.is_null());
+            core::slice::from_raw_parts_mut(ptr, self.len())
+        }
+    }
+
     // Convert back to NBL.
     // Consumes self to make sure no re-use after NBL is transferred to the kernel.
     pub fn into_nbl(self) -> *mut NetBufferList {
