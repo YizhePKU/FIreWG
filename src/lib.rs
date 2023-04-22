@@ -303,10 +303,19 @@ pub extern "C" fn rsHandleOutboundPacket(nbl: *mut NetBufferList, compartment_id
 
     log::info!("Encapsulating packet for {}", connection);
 
-    // Fix IPv4 header checksum before we actually encapsulate the packet.
-    // This is normally done by checksum offload, but it doesn't work when encapsulated.
     let fixed_packet = src_buffer.as_slice_mut_temporary();
+
+    // HACK: rewrite local_addr with Wireguard interface address.
+    // Since we don't have a real interface, the packet has the default interface address, which means
+    // the reply will not be encrypted by the peer.
+    fixed_packet[12..16].copy_from_slice(&[10, 0, 0, 2]);
+
+    // HACK: fix IPv4 header checksum before we actually encapsulate the packet.
+    // This is normally done by checksum offload, but it doesn't work when encapsulated.
     fix_ipv4_checksum(fixed_packet);
+
+    // HACK: set UDP checksum to zero, since we modified IP headers.
+    fixed_packet[header_len + 6..header_len + 8].copy_from_slice(&[0, 0]);
 
     // Encapsulate the packet.
     // IP header (20 bytes) -- UDP header (8 bytes) -- data
