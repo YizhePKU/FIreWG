@@ -188,7 +188,7 @@ pub extern "C" fn rsHandleInboundPacket(
     }
     let header_len = ((packet[0] & 0xf) * 4) as usize;
 
-    // HACK: intercept all UDP packets coming from 169.254.1.3:12345
+    // HACK: intercept all UDP packets coming from 169.254.1.3:12345 (ignoring local port & addr)
     // This should be saved in STATE.
     let local_addr: [u8; 4] = packet[16..20].try_into().unwrap();
     let local_port = u16::from_be_bytes(packet[header_len + 2..header_len + 4].try_into().unwrap());
@@ -196,7 +196,7 @@ pub extern "C" fn rsHandleInboundPacket(
     let remote_port = u16::from_be_bytes(packet[header_len..header_len + 2].try_into().unwrap());
     if remote_addr == [169, 254, 1, 3] && remote_port == 12345 {
         // Decapsulate the packet.
-        log::info!("Decapsulating packet for 169.254.1.3:12345");
+        log::info!("Decapsulating packet from 169.254.1.3:12345");
         let tunn = STATE.read().tunnels.first_key_value().unwrap().1.clone();
 
         // Decapsulate the packet.
@@ -231,9 +231,7 @@ pub extern "C" fn rsHandleInboundPacket(
                     udp_slice[2..4].copy_from_slice(&u16::to_be_bytes(12345)); // dst_port
                     udp_slice[4..6].copy_from_slice(&u16::to_be_bytes(8 + data_len as u16)); // Length
 
-                    log::info!("rsHandleInboundPacket: WriteToNetwork");
-                    log::info!("Headers: {:?}", header_slice);
-                    log::info!("Data: {:?}", data_slice);
+                    log::info!("sendPacket with header {header_slice:?} and data {data_slice:?}");
 
                     // Send the packet
                     unsafe { sendPacket(out_buffer.into_nbl(), compartment_id) };
@@ -243,8 +241,7 @@ pub extern "C" fn rsHandleInboundPacket(
                 boringtun::TunnResult::WriteToTunnelV4(packet, src_addr) => {
                     // packet may be truncated because of incorrect length, but we'll skip that.
                     // src_addr should be checked against crypto routing table, but we'll skip that.
-                    log::info!("rsHandleInboundPacket: WriteToTunnelV4");
-                    log::info!("Packet: {:?}", packet);
+                    log::info!("recvPacket {packet:?}");
                     unsafe {
                         recvPacket(
                             dst_buffer.into_nbl(),
@@ -287,12 +284,6 @@ pub extern "C" fn rsHandleOutboundPacket(nbl: *mut NetBufferList, compartment_id
         remote_port: u16::from_be_bytes(packet[header_len + 2..header_len + 4].try_into().unwrap()),
     };
 
-    log::info!(
-        "Checking {} against State {:?}",
-        connection,
-        STATE.read().connections
-    );
-
     // Check if the connection is tracked, and if so, which tunnel it is associated with.
     let tunn = match STATE.read().connections.get(&connection) {
         Some(tunn) => tunn.clone(),
@@ -300,8 +291,6 @@ pub extern "C" fn rsHandleOutboundPacket(nbl: *mut NetBufferList, compartment_id
             return true;
         }
     };
-
-    log::info!("Encapsulating packet for {}", connection);
 
     let fixed_packet = src_buffer.as_slice_mut_temporary();
 
@@ -336,9 +325,7 @@ pub extern "C" fn rsHandleOutboundPacket(nbl: *mut NetBufferList, compartment_id
             udp_slice[2..4].copy_from_slice(&u16::to_be_bytes(12345)); // dst_port
             udp_slice[4..6].copy_from_slice(&u16::to_be_bytes(8 + data.len() as u16)); // Length
 
-            log::info!("rsHandleOutboundPacket: WriteToNetwork");
-            log::info!("Headers: {:?}", header_slice);
-            log::info!("Data: {:?}", data_slice);
+            log::info!("sendPacket with header {header_slice:?} and data {data_slice:?}");
 
             // Send the packet
             unsafe { sendPacket(dst_buffer.into_nbl(), compartment_id) };
@@ -358,14 +345,10 @@ pub extern "C" fn rsHandleOutboundPacket(nbl: *mut NetBufferList, compartment_id
 // Fill-in checksum for an IPv4 packet.
 // Assumes the current checksum is zero.
 fn fix_ipv4_checksum(packet: &mut [u8]) {
-    log::info!("fix_ipv4_checksum for {:?}", packet);
-
     assert!(packet[10] == 0 && packet[11] == 0);
 
     let header_len = ((packet[0] & 0xf) * 4) as usize;
     let mut checksum = Checksum::new();
     checksum.add_bytes(&packet[..header_len]);
     packet[10..12].copy_from_slice(&checksum.checksum());
-
-    log::info!("Post fix: {:?}", packet);
 }
