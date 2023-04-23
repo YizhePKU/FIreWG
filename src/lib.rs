@@ -9,15 +9,28 @@ mod utils;
 extern crate alloc;
 
 use alloc::{borrow::ToOwned, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
-use boringtun::Tunn;
 use checksum::Checksum;
-use core::fmt::Display;
+use core::{cmp::max, fmt::Display};
 use kernel_alloc::KernelAlloc;
 use kernel_buffer::KernelBuffer;
 use kernel_log::KernelLogger;
 use log::LevelFilter;
+use serde::{Deserialize, Serialize};
 use spin::{Mutex, RwLock};
-use utils::make_tunn;
+use utils::{fmt_addr, make_tunn};
+
+#[global_allocator]
+static ALLOCATOR: KernelAlloc = KernelAlloc;
+
+#[no_mangle]
+pub extern "C" fn _fltused() {}
+
+#[panic_handler]
+fn my_panic(info: &core::panic::PanicInfo) -> ! {
+    log::error!("Panic info: {}", info);
+    // unsafe { dbgBreak() }
+    loop {}
+}
 
 extern "C" {
     pub type NetBufferList;
@@ -40,13 +53,12 @@ extern "C" {
 pub struct Appid(Vec<u16>);
 
 impl Appid {
-    pub fn new(appid: *const u8, appid_size: u32) -> Self {
-        let slice =
-            unsafe { core::slice::from_raw_parts(appid as *const u16, appid_size as usize) };
+    unsafe fn new(appid: *const u8, appid_size: u32) -> Self {
+        let slice = core::slice::from_raw_parts(appid as *const u16, appid_size as usize);
         Self(slice.to_owned())
     }
 
-    pub fn from_u16_slice(slice: &[u16]) -> Self {
+    fn from_u16_slice(slice: &[u16]) -> Self {
         Self(slice.to_owned())
     }
 }
@@ -62,48 +74,46 @@ impl Display for Appid {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
-pub struct Connection {
-    pub protocol: u8,
-    pub local_addr: [u8; 4],
-    pub local_port: u16,
-    pub remote_addr: [u8; 4],
-    pub remote_port: u16,
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Session {
+    protocol: u8, // TCP = 6, UDP = 17
+    local_addr: [u8; 4],
+    local_port: u16,
+    remote_addr: [u8; 4],
+    remote_port: u16,
 }
 
-impl Display for Connection {
+impl Display for Session {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // Remove trailing NUL when printing
         write!(
             f,
-            "Connection({} {:?}:{} --> {:?}:{})",
-            self.protocol, self.local_addr, self.local_port, self.remote_addr, self.remote_port
+            "Session({} {}:{} --> {}:{})",
+            if self.protocol == 6 { "TCP" } else { "UDP" },
+            fmt_addr(self.local_addr),
+            self.local_port,
+            fmt_addr(self.remote_addr),
+            self.remote_port
         )
     }
 }
 
-#[global_allocator]
-static ALLOCATOR: KernelAlloc = KernelAlloc;
-
-#[no_mangle]
-pub extern "C" fn _fltused() {}
-
-#[panic_handler]
-fn my_panic(info: &core::panic::PanicInfo) -> ! {
-    log::error!("Panic info: {}", info);
-    // unsafe { dbgBreak() }
-    loop {}
+#[derive(Debug, Clone)]
+struct Tunnel {
+    tunn: Arc<Mutex<boringtun::Tunn>>,
+    interface_addr: [u8; 4],
+    endpoint_addr: [u8; 4],
+    endpoint_port: u16,
 }
 
 // global state
 #[derive(Debug)]
 struct State {
-    pub tunnels: BTreeMap<Appid, Arc<Mutex<Tunn>>>,
-    pub connections: BTreeMap<Connection, Arc<Mutex<Tunn>>>,
+    tunnel_by_appid: BTreeMap<Appid, Tunnel>,
+    tunnel_by_session: BTreeMap<Session, Tunnel>,
 }
 static STATE: RwLock<State> = RwLock::new(State {
-    tunnels: BTreeMap::new(),
-    connections: BTreeMap::new(),
+    tunnel_by_appid: BTreeMap::new(),
+    tunnel_by_session: BTreeMap::new(),
 });
 
 #[no_mangle]
@@ -112,8 +122,8 @@ pub extern "C" fn rsInit() {
 
     log::info!("rsInit entry");
 
-    // Setup tracked processes
-    // Hard-coded appid for now
+    // Initialize state from config.
+    // Hardcoded for testing.
     // let filename = r"\device\harddiskvolume4\program files (x86)\nmap\ncat.exe";
     let appid = Appid::from_u16_slice(&[
         92, 100, 101, 118, 105, 99, 101, 92, 104, 97, 114, 100, 100, 105, 115, 107, 118, 111, 108,
@@ -122,29 +132,30 @@ pub extern "C" fn rsInit() {
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     ]);
-
-    // Create tunnels and associate them with appid
     let tunn = make_tunn(
         "sGayjgm8dLj0gmNcry6VeGVuKZ1jQxicvDuOpG+pO1I=",
         "RtdFk601fL2xf4ig3bryPi1kRblUSOn2JkQGbxn/hyQ=",
         0,
     );
-    STATE
-        .write()
-        .tunnels
-        .insert(appid, Arc::new(Mutex::new(tunn)));
+    let tunnel = Tunnel {
+        tunn: Arc::new(Mutex::new(tunn)),
+        interface_addr: [10, 0, 0, 2],
+        endpoint_addr: [169, 254, 1, 3],
+        endpoint_port: 12345,
+    };
+    STATE.write().tunnel_by_appid.insert(appid, tunnel);
 
     log::info!("rsInit exit");
 }
 
 #[no_mangle]
-pub extern "C" fn rsIsAppTracked(appid: *const u8, appid_size: u32) -> bool {
+pub unsafe extern "C" fn rsIsAppTracked(appid: *const u8, appid_size: u32) -> bool {
     let appid = Appid::new(appid, appid_size);
-    STATE.read().tunnels.contains_key(&appid)
+    STATE.read().tunnel_by_appid.contains_key(&appid)
 }
 
 #[no_mangle]
-pub extern "C" fn rsRegisterConnection(
+pub unsafe extern "C" fn rsRegisterConnection(
     appid: *const u8,
     appid_size: u32,
     protocol: u8,
@@ -153,196 +164,240 @@ pub extern "C" fn rsRegisterConnection(
     remote_addr: u32,
     remote_port: u16,
 ) {
-    // Skip untracked apps
-    if !rsIsAppTracked(appid, appid_size) {
-        return;
-    }
-
     let appid = Appid::new(appid, appid_size);
-    let connection = Connection {
+    let session = Session {
         protocol,
         local_addr: local_addr.to_be_bytes(),
         local_port,
         remote_addr: remote_addr.to_be_bytes(),
         remote_port,
     };
-    // Associate the connection with a tunnel, which should exist, since `rsIsAppTracked` already checks for tracking status.
-    // There is no "time-of-check to time-of-use" bug since tunnels never changes after initialization.
-    let tunn = STATE.read().tunnels.get(&appid).unwrap().clone();
-    STATE.write().connections.insert(connection, tunn);
-    log::info!("New connection for {}: {}", appid, connection);
+
+    if STATE.read().tunnel_by_appid.contains_key(&appid) {
+        // release the read lock, acquire a write lock, and re-check.
+        // https://stackoverflow.com/questions/2407558/pthreads-reader-writer-locks-upgrading-read-lock-to-write-lock
+        let mut state = STATE.write();
+        if let Some(tunnel) = state.tunnel_by_appid.get(&appid) {
+            let tunnel = tunnel.clone();
+            log::info!("New session: {}", session);
+            state.tunnel_by_session.insert(session, tunnel);
+        }
+    }
 }
 
 #[no_mangle]
-pub extern "C" fn rsHandleInboundPacket(
+pub unsafe extern "C" fn rsHandleInboundPacket(
     nbl: *mut NetBufferList,
     compartment_id: u32,
     interface_index: u32,
     sub_interface_index: u32,
 ) -> bool {
-    let src_buffer = unsafe { KernelBuffer::from_nbl(nbl) };
-
+    let src_buffer = KernelBuffer::from_nbl(nbl);
     let packet = src_buffer.as_slice();
     if packet[0] >> 4 != 4 {
         return true;
     }
-    let header_len = ((packet[0] & 0xf) * 4) as usize;
 
-    // HACK: intercept all UDP packets coming from 169.254.1.3:12345 (ignoring local port & addr)
-    // This should be saved in STATE.
-    let local_addr: [u8; 4] = packet[16..20].try_into().unwrap();
+    let header_len = ((packet[0] & 0xf) * 4) as usize;
+    // let local_addr: [u8; 4] = packet[16..20].try_into().unwrap();
     let local_port = u16::from_be_bytes(packet[header_len + 2..header_len + 4].try_into().unwrap());
     let remote_addr: [u8; 4] = packet[12..16].try_into().unwrap();
     let remote_port = u16::from_be_bytes(packet[header_len..header_len + 2].try_into().unwrap());
-    if remote_addr == [169, 254, 1, 3] && remote_port == 12345 {
-        // Decapsulate the packet.
-        log::info!("Decapsulating packet from 169.254.1.3:12345");
-        let tunn = STATE.read().tunnels.first_key_value().unwrap().1.clone();
+
+    // Find out which tunnel this session belongs to, if any.
+    let tunnels = &STATE.read().tunnel_by_session;
+    if let Some((session, tunnel)) = tunnels.iter().find(|&(session, tunnel)| {
+        local_port == session.local_port
+            && remote_addr == tunnel.endpoint_addr
+            && remote_port == tunnel.endpoint_port
+    }) {
+        log::info!(
+            "Decapsulating packet from {}:{}",
+            fmt_addr(remote_addr),
+            remote_port
+        );
 
         // Decapsulate the packet.
-        let buffer_len = packet.len(); // should be enough?
-        let mut encrypted_packet = &packet[header_len + 8..]; // set to &[] for repeated call
-        let mut tunn_lock = tunn.lock();
-        // TODO: fill-in src_addr for under-load condition
+        // Loop until all queued packets are sent.
+        let mut datagram = &packet[header_len + 8..]; // set to &[] for repeated call
         loop {
-            let mut dst_buffer = KernelBuffer::new(buffer_len);
-            match tunn_lock.decapsulate(None, encrypted_packet, dst_buffer.as_slice_mut()) {
+            // Allocate a buffer for decapsulated packet.
+            let buffer_size = if datagram != &[] {
+                // Decapsulated packets are always smaller than the original.
+                packet.len()
+            } else {
+                // We don't know the length of queued packets, so it's better to be safe.
+                2000
+            };
+            let mut dst_buffer = KernelBuffer::new(buffer_size);
+
+            // Setting src_addr to None disables cookies (which causes error when tunnel is underload).
+            let mut tunn = tunnel.tunn.lock();
+            match tunn.decapsulate(None, datagram, dst_buffer.as_slice_mut()) {
                 boringtun::TunnResult::Done => {
-                    log::info!("TunnResult::Done");
-                    return false;
-                }
-                boringtun::TunnResult::WriteToNetwork(data) => {
-                    let data_len = data.len();
-                    // allocate a new NBL and copy the encrypted packet, since we need to add headers.
-                    let mut out_buffer = KernelBuffer::new(28 + data_len);
-                    let (header_slice, data_slice) = out_buffer.as_slice_mut().split_at_mut(28);
-                    let (ipv4_slice, udp_slice) = header_slice.split_at_mut(20);
-                    data_slice.copy_from_slice(data);
-                    // free-up dst_buffer since we'll not inject it to the network.
-                    unsafe { freeNetBufferList(dst_buffer.into_nbl()) };
-
-                    ipv4_slice[0] = 0x45; // Version & IHL
-                    ipv4_slice[2..4].copy_from_slice(&u16::to_be_bytes(28 + data_len as u16)); // Total length
-                    ipv4_slice[8] = 64; // TTL
-                    ipv4_slice[9] = 17; // Protocol = UDP
-                    ipv4_slice[12..16].copy_from_slice(&local_addr); // src_addr
-                    ipv4_slice[16..20].copy_from_slice(&[169, 254, 1, 3]); // dst_addr
-                    udp_slice[0..2].copy_from_slice(&u16::to_be_bytes(local_port)); // src_port
-                    udp_slice[2..4].copy_from_slice(&u16::to_be_bytes(12345)); // dst_port
-                    udp_slice[4..6].copy_from_slice(&u16::to_be_bytes(8 + data_len as u16)); // Length
-
-                    log::info!("sendPacket with header {header_slice:?} and data {data_slice:?}");
-
-                    // Send the packet
-                    unsafe { sendPacket(out_buffer.into_nbl(), compartment_id) };
-
-                    encrypted_packet = &mut []; // loop and call decapsulate() again
-                }
-                boringtun::TunnResult::WriteToTunnelV4(packet, src_addr) => {
-                    // packet may be truncated because of incorrect length, but we'll skip that.
-                    // src_addr should be checked against crypto routing table, but we'll skip that.
-                    log::info!("recvPacket {packet:?}");
-
-                    // HACK: rewrite dst_addr with original IP (instead of wireguard interface IP)
-                    // so that local application can recognize the packet.
-                    packet[16..20].copy_from_slice(&local_addr);
-                    fix_checksum(packet);
-
-                    unsafe {
-                        recvPacket(
-                            dst_buffer.into_nbl(),
-                            compartment_id,
-                            interface_index,
-                            sub_interface_index,
-                        );
-                    }
-                    return false;
-                }
-                boringtun::TunnResult::WriteToTunnelV6(_, _) => {
-                    log::error!("IPv6 encapsulation is not supported");
-                    return false;
+                    log::info!("All queued packets sent, Done.");
+                    break;
                 }
                 boringtun::TunnResult::Err(err) => {
                     log::error!("Decapsulation error: {:?}", err);
-                    return false;
+                    break;
+                }
+                boringtun::TunnResult::WriteToNetwork(packet) => {
+                    // Copy the queued packet to a new NBL to make space for headers.
+                    // The copy could be avoided by prepending memory to the NBL.
+                    let mut copy_buffer = KernelBuffer::new(28 + packet.len());
+                    let (header_slice, data_slice) = copy_buffer.as_slice_mut().split_at_mut(28);
+                    let (ipv4_slice, udp_slice) = header_slice.split_at_mut(20);
+                    // When sending queued packets, session.local_addr/port may be different from
+                    // that of the inner packet. This is fine since we perform NAT based on the inner packet.
+                    ipv4_slice[0] = 0x45; // Version & IHL
+                    ipv4_slice[2..4].copy_from_slice(&u16::to_be_bytes(28 + packet.len() as u16)); // Length
+                    ipv4_slice[8] = 64; // TTL
+                    ipv4_slice[9] = 17; // Protocol = UDP
+                    ipv4_slice[12..16].copy_from_slice(&session.local_addr); // src_addr
+                    ipv4_slice[16..20].copy_from_slice(&tunnel.endpoint_addr); // dst_addr
+                    udp_slice[0..2].copy_from_slice(&u16::to_be_bytes(session.local_port)); // src_port
+                    udp_slice[2..4].copy_from_slice(&u16::to_be_bytes(tunnel.endpoint_port)); // dst_port
+                    udp_slice[4..6].copy_from_slice(&u16::to_be_bytes(8 + packet.len() as u16)); // Length
+                    data_slice.copy_from_slice(packet);
+
+                    // Free up dst_buffer since we'll not inject it to the network.
+                    freeNetBufferList(dst_buffer.into_nbl());
+
+                    log::info!(
+                        "Sending queued packet, header: {:?}, data: {:?}",
+                        header_slice,
+                        data_slice
+                    );
+                    sendPacket(copy_buffer.into_nbl(), compartment_id);
+
+                    // Repeat the call to decapsulate() with empty datagram.
+                    datagram = &[];
+                    continue;
+                }
+                boringtun::TunnResult::WriteToTunnelV4(packet, _) => {
+                    // Perform reverse NAT (using the inner local port, not the outer).
+                    let local_addr = {
+                        if packet[0] >> 4 != 4 {
+                            log::error!("Decapsulated packet is not IPv4: {packet:?}");
+                            break;
+                        }
+                        if packet[9] != 6 && packet[9] != 17 {
+                            log::error!("Decapsulated packet is not TCP or UDP: {packet:?}");
+                            break;
+                        }
+                        let header_len = ((packet[0] & 0xf) * 4) as usize;
+                        let local_port = u16::from_be_bytes(
+                            packet[header_len + 2..header_len + 4].try_into().unwrap(),
+                        );
+                        let state = STATE.read();
+                        log::info!("{:?}, {}", state.tunnel_by_session, local_port);
+                        let session = state
+                            .tunnel_by_session
+                            .keys()
+                            .find(|&session| session.local_port == local_port)
+                            .unwrap(); // FIXME: This should be fine...right?
+                        session.local_addr
+                    };
+                    packet[16..20].copy_from_slice(&local_addr);
+                    fix_checksum(packet);
+
+                    log::info!("recvPacket {packet:?}");
+                    recvPacket(
+                        dst_buffer.into_nbl(),
+                        compartment_id,
+                        interface_index,
+                        sub_interface_index,
+                    );
+                    break;
+                }
+                boringtun::TunnResult::WriteToTunnelV6(_, _) => {
+                    log::error!("IPv6 encapsulation is not supported");
+                    break;
                 }
             }
         }
+        return false;
     } else {
         return true;
     }
 }
 
 #[no_mangle]
-pub extern "C" fn rsHandleOutboundPacket(nbl: *mut NetBufferList, compartment_id: u32) -> bool {
-    let mut src_buffer = unsafe { KernelBuffer::from_nbl(nbl) };
-
+pub unsafe extern "C" fn rsHandleOutboundPacket(
+    nbl: *mut NetBufferList,
+    compartment_id: u32,
+) -> bool {
+    let mut src_buffer = KernelBuffer::from_nbl(nbl);
     let packet = src_buffer.as_slice();
     if packet[0] >> 4 != 4 {
         return true;
     }
+
     let header_len = ((packet[0] & 0xf) * 4) as usize;
-    let connection = Connection {
-        protocol: packet[9],
-        local_addr: packet[12..16].try_into().unwrap(),
-        local_port: u16::from_be_bytes(packet[header_len..header_len + 2].try_into().unwrap()),
-        remote_addr: packet[16..20].try_into().unwrap(),
-        remote_port: u16::from_be_bytes(packet[header_len + 2..header_len + 4].try_into().unwrap()),
+    let (ipv4_slice, transport_slice) = packet.split_at(header_len);
+    let session = Session {
+        protocol: ipv4_slice[9],
+        local_addr: ipv4_slice[12..16].try_into().unwrap(),
+        local_port: u16::from_be_bytes(transport_slice[..2].try_into().unwrap()),
+        remote_addr: ipv4_slice[16..20].try_into().unwrap(),
+        remote_port: u16::from_be_bytes(transport_slice[2..4].try_into().unwrap()),
     };
 
-    // Check if the connection is tracked, and if so, which tunnel it is associated with.
-    let tunn = match STATE.read().connections.get(&connection) {
-        Some(tunn) => tunn.clone(),
-        None => {
-            return true;
+    // Check if the session is tracked.
+    if let Some(tunnel) = STATE.read().tunnel_by_session.get(&session) {
+        let tunnel = tunnel.clone();
+
+        log::info!(
+            "Encapsulating packet to {}:{}",
+            fmt_addr(session.remote_addr),
+            session.remote_port
+        );
+
+        // Perform NAT.
+        let temp_packet = src_buffer.as_slice_mut_temporary();
+        temp_packet[12..16].copy_from_slice(&tunnel.interface_addr);
+
+        // Fix checksums before we encapsulate the packet.
+        // IPv4 checksum is normally done by checksum offload, but it doesn't work inside encapsulated packets.
+        // Also, since we modified src_addr, the original TCP/UDP checksum is now incorrect.
+        fix_checksum(temp_packet);
+
+        // Encapsulate the packet.
+        let mut dst_buffer = KernelBuffer::new(28 + max(temp_packet.len() + 32, 148));
+        let (header_slice, data_slice) = dst_buffer.as_slice_mut().split_at_mut(28);
+        let (ipv4_slice, udp_slice) = header_slice.split_at_mut(20);
+        match tunnel.tunn.lock().encapsulate(temp_packet, data_slice) {
+            boringtun::TunnResult::WriteToNetwork(data) => {
+                ipv4_slice[0] = 0x45; // Version & IHL
+                ipv4_slice[2..4].copy_from_slice(&u16::to_be_bytes(28 + data.len() as u16)); // Length
+                ipv4_slice[8] = 64; // TTL
+                ipv4_slice[9] = 17; // Protocol = UDP
+                ipv4_slice[12..16].copy_from_slice(&session.local_addr); // src_addr
+                ipv4_slice[16..20].copy_from_slice(&tunnel.endpoint_addr); // dst_addr
+                udp_slice[0..2].copy_from_slice(&u16::to_be_bytes(session.local_port)); // src_port
+                udp_slice[2..4].copy_from_slice(&u16::to_be_bytes(tunnel.endpoint_port)); // dst_port
+                udp_slice[4..6].copy_from_slice(&u16::to_be_bytes(8 + data.len() as u16)); // Length
+
+                log::info!(
+                    "sendPacket with header {:?} and data {:?}",
+                    header_slice,
+                    data_slice
+                );
+
+                sendPacket(dst_buffer.into_nbl(), compartment_id);
+            }
+            boringtun::TunnResult::Done => {
+                log::info!("Handshake in flight, packet queued for sending");
+            }
+            boringtun::TunnResult::Err(err) => {
+                log::error!("Encapsulation error: {:?}", err);
+            }
+            _ => unreachable!(),
         }
-    };
-
-    let temp_packet = src_buffer.as_slice_mut_temporary();
-
-    // HACK: rewrite local_addr with Wireguard interface address.
-    // Since we don't have a real interface, the packet has the default interface address, which means
-    // the reply will not be encrypted by the peer.
-    temp_packet[12..16].copy_from_slice(&[10, 0, 0, 2]);
-
-    // Fix IPv4 header checksum before we actually encapsulate the packet.
-    // This is normally done by checksum offload, but it doesn't work when encapsulated.
-    // Also, since we modified local_addr, the original TCP/UDP checksum is now incorrect.
-    fix_checksum(temp_packet);
-
-    // Encapsulate the packet.
-    // IP header (20 bytes) -- UDP header (8 bytes) -- data
-    let mut dst_buffer = KernelBuffer::new(20 + 8 + core::cmp::max(temp_packet.len() + 32, 148));
-    let (header_slice, data_slice) = dst_buffer.as_slice_mut().split_at_mut(28);
-    let (ipv4_slice, udp_slice) = header_slice.split_at_mut(20);
-    let mut tunn_lock = tunn.lock();
-    match tunn_lock.encapsulate(temp_packet, data_slice) {
-        boringtun::TunnResult::WriteToNetwork(data) => {
-            ipv4_slice[0] = 0x45; // Version & IHL
-            ipv4_slice[2..4].copy_from_slice(&u16::to_be_bytes(28 + data.len() as u16)); // Total length
-            ipv4_slice[8] = 64; // TTL
-            ipv4_slice[9] = 17; // Protocol = UDP
-            ipv4_slice[12..16].copy_from_slice(&connection.local_addr); // src_addr
-            ipv4_slice[16..20].copy_from_slice(&[169, 254, 1, 3]); // dst_addr
-
-            udp_slice[0..2].copy_from_slice(&u16::to_be_bytes(connection.local_port)); // src_port
-            udp_slice[2..4].copy_from_slice(&u16::to_be_bytes(12345)); // dst_port
-            udp_slice[4..6].copy_from_slice(&u16::to_be_bytes(8 + data.len() as u16)); // Length
-
-            log::info!("sendPacket with header {header_slice:?} and data {data_slice:?}");
-
-            // Send the packet
-            unsafe { sendPacket(dst_buffer.into_nbl(), compartment_id) };
-            return false;
-        }
-        boringtun::TunnResult::Done => {
-            return false;
-        }
-        boringtun::TunnResult::Err(err) => {
-            log::error!("Encryption error: {:?}", err);
-            return false;
-        }
-        _ => unreachable!(),
+        return false;
+    } else {
+        return true;
     }
 }
 
@@ -351,38 +406,41 @@ fn fix_checksum(packet: &mut [u8]) {
     let protocal = packet[9];
     let ipv4_header_len = ((packet[0] & 0xf) * 4) as usize;
 
-    let (ip_header, transport_header) = packet.split_at_mut(ipv4_header_len);
+    let (ip_header, transport_segment) = packet.split_at_mut(ipv4_header_len);
 
     // clear IPv4 checksum
     ip_header[10..12].copy_from_slice(&[0, 0]);
 
     if protocal == 6 {
         // clear TCP checksum
-        transport_header[16..18].copy_from_slice(&[0, 0]);
+        transport_segment[16..18].copy_from_slice(&[0, 0]);
     } else if protocal == 17 {
         // clear UDP checksum
-        transport_header[6..8].copy_from_slice(&[0, 0]);
+        transport_segment[6..8].copy_from_slice(&[0, 0]);
     } else {
         unreachable!()
     }
 
-    let mut checksum = Checksum::new();
-
     // calculate IPv4 checksum
-    checksum.add_bytes(ip_header);
-    let ipv4_checksum = checksum.checksum();
+    let mut ipv4_checksum = Checksum::new();
+    ipv4_checksum.add_bytes(ip_header);
+    ip_header[10..12].copy_from_slice(&ipv4_checksum.checksum());
 
-    // FIXME: Leaving TCP/UDP checksums with zero
+    if protocal == 6 {
+        // calculate TCP checksum
+        let mut tcp_checksum = Checksum::new();
+        tcp_checksum.add_bytes(&ip_header[12..20]); // src_addr & dst_addr
+        tcp_checksum.add_bytes(&[0, 6]); // protocol = 6
+        tcp_checksum.add_bytes(&u16::to_be_bytes(transport_segment.len() as u16)); // TCP length
+        tcp_checksum.add_bytes(transport_segment); // TCP header & data
 
-    // if protocal == 6 {
-    //     // fill in TCP checksum
-    //     transport_header[16..18].copy_from_slice(&[0, 0]);
-    // } else if protocal == 17 {
-    //     // UDP checksum is optional in IPv4, skipping
-    // } else {
-    //     unreachable!()
-    // }
+        transport_segment[16..18].copy_from_slice(&tcp_checksum.checksum());
+        log::info!("Calculated TCP checksum is {:?}", tcp_checksum.checksum());
+    } else if protocal == 17 {
+        // UDP checksum is optional in IPv4, skipping
+    } else {
+        unreachable!()
+    }
 
     // fill in IPv4 checksum
-    packet[10..12].copy_from_slice(&ipv4_checksum);
 }

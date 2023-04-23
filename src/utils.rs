@@ -1,3 +1,4 @@
+use alloc::{format, string::String};
 use base64::Engine;
 use boringtun::Tunn;
 
@@ -55,4 +56,8 @@ pub fn make_tunn(privkey: &str, pubkey: &str, peer_id: u32) -> Tunn {
     )
     .unwrap();
     return tunn;
+}
+
+pub fn fmt_addr(addr: [u8; 4]) -> String {
+    format!("{}.{}.{}.{}", addr[0], addr[1], addr[2], addr[3])
 }
