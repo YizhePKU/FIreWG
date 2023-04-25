@@ -118,7 +118,7 @@ static STATE: RwLock<State> = RwLock::new(State {
 
 #[no_mangle]
 pub extern "C" fn rsInit() {
-    KernelLogger::init(LevelFilter::Info).expect("Failed to initialize logger");
+    KernelLogger::init(LevelFilter::Debug).expect("Failed to initialize logger");
 
     log::info!("rsInit entry");
 
@@ -211,6 +211,8 @@ pub unsafe extern "C" fn rsHandleInboundPacket(
             && remote_addr == tunnel.endpoint_addr
             && remote_port == tunnel.endpoint_port
     }) {
+        let tunnel = tunnel.clone();
+
         log::info!(
             "Decapsulating packet from {}:{}",
             fmt_addr(remote_addr),
@@ -231,9 +233,12 @@ pub unsafe extern "C" fn rsHandleInboundPacket(
             };
             let mut dst_buffer = KernelBuffer::new(buffer_size);
 
-            // Setting src_addr to None disables cookies (which causes error when tunnel is underload).
-            let mut tunn = tunnel.tunn.lock();
-            match tunn.decapsulate(None, datagram, dst_buffer.as_slice_mut()) {
+            let result = {
+                let mut tunn = tunnel.tunn.lock();
+                // Setting src_addr to None disables cookies (which causes error when tunnel is underload).
+                tunn.decapsulate(None, datagram, dst_buffer.as_slice_mut())
+            };
+            match result {
                 boringtun::TunnResult::Done => {
                     log::info!("All queued packets sent, Done.");
                     break;
@@ -291,7 +296,6 @@ pub unsafe extern "C" fn rsHandleInboundPacket(
                             packet[header_len + 2..header_len + 4].try_into().unwrap(),
                         );
                         let state = STATE.read();
-                        log::info!("{:?}, {}", state.tunnel_by_session, local_port);
                         let session = state
                             .tunnel_by_session
                             .keys()
@@ -367,7 +371,11 @@ pub unsafe extern "C" fn rsHandleOutboundPacket(
         let mut dst_buffer = KernelBuffer::new(28 + max(temp_packet.len() + 32, 148));
         let (header_slice, data_slice) = dst_buffer.as_slice_mut().split_at_mut(28);
         let (ipv4_slice, udp_slice) = header_slice.split_at_mut(20);
-        match tunnel.tunn.lock().encapsulate(temp_packet, data_slice) {
+        let result = {
+            let mut tunn = tunnel.tunn.lock();
+            tunn.encapsulate(temp_packet, data_slice)
+        };
+        match result {
             boringtun::TunnResult::WriteToNetwork(data) => {
                 ipv4_slice[0] = 0x45; // Version & IHL
                 ipv4_slice[2..4].copy_from_slice(&u16::to_be_bytes(28 + data.len() as u16)); // Length
@@ -433,14 +441,10 @@ fn fix_checksum(packet: &mut [u8]) {
         tcp_checksum.add_bytes(&[0, 6]); // protocol = 6
         tcp_checksum.add_bytes(&u16::to_be_bytes(transport_segment.len() as u16)); // TCP length
         tcp_checksum.add_bytes(transport_segment); // TCP header & data
-
         transport_segment[16..18].copy_from_slice(&tcp_checksum.checksum());
-        log::info!("Calculated TCP checksum is {:?}", tcp_checksum.checksum());
     } else if protocal == 17 {
         // UDP checksum is optional in IPv4, skipping
     } else {
         unreachable!()
     }
-
-    // fill in IPv4 checksum
 }
