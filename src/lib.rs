@@ -296,12 +296,22 @@ pub unsafe extern "C" fn rsHandleInboundPacket(
                             packet[header_len + 2..header_len + 4].try_into().unwrap(),
                         );
                         let state = STATE.read();
-                        let session = state
+                        match state
                             .tunnel_by_session
                             .keys()
                             .find(|&session| session.local_port == local_port)
-                            .unwrap(); // FIXME: This should be fine...right?
-                        session.local_addr
+                        {
+                            Some(session) => session.local_addr,
+                            None => {
+                                log::error!(
+                                    "Could not perform reverse NAT with local port {}, packet: {:?}, current sessions: {:?}",
+                                    local_port,
+                                    packet,
+                                    state.tunnel_by_session.keys()
+                                );
+                                break;
+                            }
+                        }
                     };
                     packet[16..20].copy_from_slice(&local_addr);
                     fix_checksum(packet);
