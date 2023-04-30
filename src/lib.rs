@@ -207,9 +207,9 @@ pub unsafe extern "C" fn rsHandleInboundPacket(
     // Find out which tunnel this session belongs to, if any.
     let tunnels = &STATE.read().tunnel_by_session;
     if let Some((session, tunnel)) = tunnels.iter().find(|&(session, tunnel)| {
-        local_port == session.local_port
-            && remote_addr == tunnel.endpoint_addr
-            && remote_port == tunnel.endpoint_port
+        // remote_addr is allowed to be different from session.remote_addr (endpoint roaming)
+        // Actual roaming is not implemented, though.
+        local_port == session.local_port && remote_port == tunnel.endpoint_port
     }) {
         let tunnel = tunnel.clone();
 
