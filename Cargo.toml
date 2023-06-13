@@ -24,7 +24,7 @@ base64 = { version = "0.21.0", default-features = false, features = ["alloc"] }
 spin = "0.9.7"
 
 [patch.crates-io]
-boringtun = { path = "../boringtun" }
-hifitime = { path = "../hifitime" } # fix fmod linking bug
-ring = { path = "../ring" } # disable RTC & assert; compile C code in kernel mode
-getrandom = { path = "../getrandom" } # force the use of rdrand
+boringtun = { path = "./patches/boringtun" }
+hifitime = { path = "./patches/hifitime" } # fix fmod linking bug
+ring = { path = "./patches/ring" } # disable RTC & assert; compile C code in kernel mode
+getrandom = { path = "./patches/getrandom" } # force the use of rdrand
